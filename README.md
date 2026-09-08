@@ -1,13 +1,14 @@
 # Security-Hardened Kubernetes Platform
 
-Cluster-level security hardening applied to the workloads deployed in [flask-k8s-cicd](../flask-k8s-cicd) — RBAC, NetworkPolicy, and Pod Security controls layered on top of an existing Flask + Postgres application, without modifying the application itself.
+Cluster-level security hardening applied to the workloads deployed in [flask-k8s-cicd](../flask-k8s-cicd) — RBAC, NetworkPolicy, Pod Security Standards, and image scanning layered on top of an existing Flask + Postgres application.
 
 ## What this project demonstrates
 
 - Role-Based Access Control (RBAC): least-privilege identities and permissions, verified with `kubectl auth can-i`
 - Network segmentation between workloads using NetworkPolicy
-- An honest understanding of the difference between *defining* a security policy and a cluster actually *enforcing* it
-- Practical debugging of real Kubernetes YAML/RBAC issues (documented below, not hidden)
+- Pod Security Standards enforcement at the namespace level, including a real fix for a non-obvious Kubernetes verification gap
+- Container image vulnerability scanning with a measured before/after improvement
+- An honest understanding of the difference between *defining* a security control and a cluster actually *enforcing* it
 
 ## Project structure
 
@@ -23,56 +24,88 @@ k8s-security-hardening/
 
 ## 1. RBAC — least-privilege access control
 
-**What was built:**
-- A dedicated namespace (`rbac-file`) to isolate practice/demo resources from the real application
-- A ServiceAccount (`readonly-sa`) — an identity with no permissions by default
-- A Role (`pod-reader`) granting only `get`, `list`, `watch` on pods — explicitly excluding `create`, `update`, `delete`
-- A RoleBinding connecting the ServiceAccount to the Role
+- Dedicated namespace (`rbac-file`) isolating this demo from the real application
+- ServiceAccount (`readonly-sa`) with a Role (`pod-reader`) granting only `get`, `list`, `watch` on pods — no `create`/`update`/`delete`
+- A RoleBinding connecting the two
 
-**Verification (not just "it applied without error" — actual proof of enforcement):**
+**Verification:**
 ```bash
 kubectl auth can-i get pods --as=system:serviceaccount:rbac-file:readonly-sa -n rbac-file
 # yes
-
 kubectl auth can-i delete pods --as=system:serviceaccount:rbac-file:readonly-sa -n rbac-file
 # no
 ```
 
-This contrast — allowed for reads, denied for writes — is the actual evidence that RBAC is being enforced correctly, not just configured.
-
-**Real-world application:** this same pattern would apply to CI/CD credentials (e.g., a GitHub Actions kubeconfig scoped to only update a specific Deployment in a specific namespace, rather than holding cluster-admin), monitoring tools that only need read access, or junior engineers who need visibility without write access to production.
+**Real-world application:** the same pattern would scope a CI/CD pipeline's kubeconfig to only update Deployments in one namespace, rather than holding cluster-admin — limiting the blast radius if that credential ever leaked.
 
 ## 2. NetworkPolicy — restricting pod-to-pod traffic
 
-**What was built:** a policy restricting the Postgres pod to only accept incoming connections from Flask pods, on port 5432:
+A policy restricting Postgres to only accept connections from Flask pods, on port 5432.
 
+**Before:** any pod (tested with an unrelated nginx pod) could reach Postgres directly — connection succeeded (curl exit code 52, "empty reply," meaning TCP connected fine, Postgres just doesn't speak HTTP).
+
+**Known limitation, documented honestly:** after applying the policy, traffic was still not blocked. Root cause: Docker Desktop's Kubernetes uses **kindnet** as its CNI, which does not implement NetworkPolicy enforcement (confirmed by checking `kube-system` — no Calico/Cilium/Weave present). The policy is correctly defined and visible via `kubectl get networkpolicy`, but nothing in this cluster's networking layer enforces it. This exact policy would be enforced without changes on EKS or with Calico installed locally.
+
+## 3. Pod Security Standards — enforced, with a real fix required
+
+```bash
+kubectl label namespace default pod-security.kubernetes.io/enforce=restricted
+```
+
+Unlike NetworkPolicy, this **is** enforced directly by the API server. Applying it immediately flagged existing pods, and a subsequent rollout restart **genuinely failed**:
+
+```
+Error: container has runAsNonRoot and image has non-numeric user (appuser),
+cannot verify user is non-root
+```
+
+**The gap:** the Dockerfile already uses `USER appuser` (non-root), but Kubernetes' `runAsNonRoot: true` check cannot verify a *named* user is safe — it requires a numeric UID it can confirm is non-zero.
+
+**The fix** — found the actual UID (`docker run ... id appuser` → `100`) and made it explicit in `deployment.yaml`:
 ```yaml
-podSelector:
-  matchLabels:
-    app: postgres
-ingress:
-  - from:
-      - podSelector:
-          matchLabels:
-            app: flask-app
-    ports:
-      - protocol: TCP
-        port: 5432
+securityContext:            # pod-level
+  runAsNonRoot: true
+  runAsUser: 100
+  seccompProfile:
+    type: RuntimeDefault
+```
+```yaml
+securityContext:            # container-level
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 ```
 
-**Before applying this policy**, any pod in the namespace — including an unrelated nginx pod used purely as a test — could reach Postgres directly:
-```bash
-kubectl exec -it <nginx-pod> -- curl -s postgres-service:5432
-# empty reply from server (curl exit code 52) — connection succeeded
-```
+After this fix, all 3 Flask pods rolled out successfully under the `restricted` standard, with `/readyz` and database connectivity confirmed still working.
 
-**Known limitation, documented honestly:** after applying the policy, the connection was still not blocked. Investigation confirmed the cause: Docker Desktop's Kubernetes uses **kindnet** as its CNI (Container Network Interface) plugin, which does not implement NetworkPolicy enforcement. The policy object is created correctly and is visible via `kubectl get networkpolicy`, but nothing in this cluster's networking layer actually reads and enforces it.
+## 4. Image scanning — Docker Scout
 
 ```bash
-kubectl get pods -n kube-system
-# kindnet-xxxxx present; no calico/cilium/weave
+docker scout quickview sruthidoc07/flask-k8s-cicd:latest
 ```
 
-This is a platform limitation, not a configuration error — the identical policy YAML would be enforced without any changes on a cloud cluster like EKS (which supports CNI plugins with NetworkPolicy support), or locally with Calico installed alongside kindnet.
+**Baseline result:**
+| Severity | Count |
+|---|---|
+| Critical | 1 |
+| High | 4 |
+| Medium | 7 |
+| Low | 31 |
+| Health score | D (44%) |
 
+Scout identified the vulnerabilities as almost entirely inherited from a stale pull of the `python:3.12-slim` base image, not from application code.
+
+**Action taken:** rebuilt the image with `docker build --no-cache`, forcing a fresh pull of the base image layer (base image tags are patched over time under the same name — an old local build can lag behind the current, more-patched version).
+
+**Result after rebuild and push:**
+| Severity | Count |
+|---|---|
+| Critical | 0 |
+| High | 1 |
+| Medium | 6 |
+| Low | 26 |
+| Health score | C (67%) |
+
+The "Fixable critical or high vulnerabilities" policy flipped from failing to passing — everything that had an available fix was resolved with zero code changes, purely by refreshing the base layer.
 
